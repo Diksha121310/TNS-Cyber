@@ -91,3 +91,31 @@ def test_empty_event_list_is_accepted(tmp_path: Path):
     record_events(folder_id, [], db_path)
 
     assert list_events(db_path) == []
+
+
+def test_duplicate_audit_event_is_recorded_only_once(tmp_path: Path):
+    folder = tmp_path / "protected"
+    folder.mkdir()
+
+    db_path = tmp_path / "test.db"
+    initialize_database(db_path)
+    folder_id = register_folder(folder, db_path)
+
+    event = {
+        "type": "modified",
+        "path": str(folder / "a.txt"),
+        "old_hash": "old_hash",
+        "new_hash": "new_hash",
+    }
+
+    # Record the same detected state twice.
+    record_events(folder_id, [event], db_path)
+    record_events(folder_id, [event], db_path)
+
+    events = list_events(db_path)
+
+    assert len(events) == 1
+    assert events[0]["event_type"] == "modified"
+    assert events[0]["file_path"] == str(folder / "a.txt")
+    assert events[0]["old_hash"] == "old_hash"
+    assert events[0]["new_hash"] == "new_hash"

@@ -171,38 +171,67 @@ def load_baseline(
         return {row["file_path"]: row["sha256"] for row in rows}
 
 
+
 def record_events(
     folder_id: int,
     events: list[dict[str, str | None]],
     db_path: str | Path = DEFAULT_DB_PATH,
 ) -> None:
-    """Persist detected events with UTC timestamps."""
+    """Persist newly observed event states with UTC timestamps."""
     if not events:
         return
 
     timestamp = datetime.now(timezone.utc).isoformat()
 
     with get_connection(db_path) as connection:
-        connection.executemany(
-            """
-            INSERT INTO audit_events (
-                folder_id, event_type, file_path,
-                old_hash, new_hash, detected_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            [
+        for event in events:
+            event_type = event["type"]
+            file_path = event["path"]
+            old_hash = event["old_hash"]
+            new_hash = event["new_hash"]
+
+            # Skip only if this exact event state has already been logged
+            # for this folder and path.
+            existing = connection.execute(
+                """
+                SELECT 1
+                FROM audit_events
+                WHERE folder_id = ?
+                  AND file_path = ?
+                  AND event_type = ?
+                  AND old_hash IS ?
+                  AND new_hash IS ?
+                LIMIT 1
+                """,
                 (
                     folder_id,
-                    event["type"],
-                    event["path"],
-                    event["old_hash"],
-                    event["new_hash"],
-                    timestamp,
+                    file_path,
+                    event_type,
+                    old_hash,
+                    new_hash,
+                ),
+            ).fetchone()
+
+            if existing is not None:
+                continue
+
+            connection.execute(
+                """
+                INSERT INTO audit_events (
+                    folder_id, event_type, file_path,
+                    old_hash, new_hash, detected_at
                 )
-                for event in events
-            ],
-        )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    folder_id,
+                    event_type,
+                    file_path,
+                    old_hash,
+                    new_hash,
+                    timestamp,
+                ),
+            )
 
 
 def list_folders(
