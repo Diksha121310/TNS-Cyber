@@ -10,7 +10,9 @@ from src.filesentinel.database import (
     has_baseline,
     load_baseline,
     save_baseline,
-    record_events,
+    load_observed_state,
+    has_observed_state,
+    record_events_and_update_observed,
 )
 
 
@@ -51,15 +53,15 @@ def initialize_folder(
     }
 
 
+
+
 def check_folder(
     folder_path: str | Path,
     db_path: str | Path = DEFAULT_DB_PATH,
 ) -> dict:
     """
-    Scan a monitored folder and compare it with its trusted baseline.
-
-    Detected events are logged, but the baseline is not automatically
-    changed. Failed scans propagate as errors.
+    Compare the current scan with the latest observed state.
+    Record events and update observed state after a successful scan.
     """
     initialize_database(db_path)
 
@@ -75,13 +77,26 @@ def check_folder(
             "No baseline exists. Initialize this folder before checking it."
         )
 
-    # Complete scan first. If scanning raises, no events are recorded
-    # and the stored baseline remains unchanged.
+    # Do not record changes from an incomplete or failed scan.
     current = scan_folder(folder)
-    baseline = load_baseline(folder_id, db_path)
 
-    events = detect_changes(baseline, current)
-    record_events(folder_id, events, db_path)
+    observed = load_observed_state(folder_id, db_path)
+
+    if has_observed_state(folder_id, db_path):
+        # Compare against the latest successfully observed state.
+        events = detect_changes(observed, current)
+    else:
+        # First check for databases created before observed-state tracking.
+        baseline = load_baseline(folder_id, db_path)
+        events = detect_changes(baseline, current)
+
+    # IMPORTANT: Save events and observed state on EVERY successful check.
+    record_events_and_update_observed(
+        folder_id,
+        events,
+        current,
+        db_path,
+    )
 
     return {
         "folder_id": folder_id,

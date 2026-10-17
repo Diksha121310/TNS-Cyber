@@ -41,6 +41,25 @@ def initialize_database(db_path: str | Path = DEFAULT_DB_PATH) -> None:
                     ON DELETE CASCADE
             );
 
+            
+            CREATE TABLE IF NOT EXISTS observed_files (
+                folder_id INTEGER NOT NULL,
+                file_path TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                PRIMARY KEY (folder_id, file_path),
+                FOREIGN KEY (folder_id)
+                    REFERENCES monitored_folders(id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS observed_state (
+                folder_id INTEGER PRIMARY KEY,
+                initialized_at TEXT NOT NULL,
+                FOREIGN KEY (folder_id)
+                    REFERENCES monitored_folders(id)
+                    ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS audit_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 folder_id INTEGER NOT NULL,
@@ -118,16 +137,16 @@ def save_baseline(
     fingerprints: dict[str, str],
     db_path: str | Path = DEFAULT_DB_PATH,
 ) -> None:
+    """Save a trusted baseline and synchronize the observed state atomically."""
     timestamp = datetime.now(timezone.utc).isoformat()
 
     with get_connection(db_path) as connection:
-        # Replace the previous snapshot completely.
+        # Replace the trusted baseline.
         connection.execute(
             "DELETE FROM file_baselines WHERE folder_id = ?",
             (folder_id,),
         )
 
-        # Store the complete new snapshot.
         connection.executemany(
             """
             INSERT INTO file_baselines
@@ -140,7 +159,6 @@ def save_baseline(
             ],
         )
 
-        # Record initialization even if the folder contains zero files.
         connection.execute(
             """
             INSERT INTO baseline_state (folder_id, initialized_at)
@@ -151,6 +169,33 @@ def save_baseline(
             (folder_id, timestamp),
         )
 
+        # A newly accepted baseline is also the latest observed state.
+        connection.execute(
+            "DELETE FROM observed_files WHERE folder_id = ?",
+            (folder_id,),
+        )
+
+        connection.executemany(
+            """
+            INSERT INTO observed_files (folder_id, file_path, sha256)
+            VALUES (?, ?, ?)
+            """,
+            [
+                (folder_id, path, digest)
+                for path, digest in fingerprints.items()
+            ],
+        )
+
+        # Mark the state initialized even if fingerprints is empty.
+        connection.execute(
+            """
+            INSERT INTO observed_state (folder_id, initialized_at)
+            VALUES (?, ?)
+            ON CONFLICT(folder_id) DO UPDATE SET
+                initialized_at = excluded.initialized_at
+            """,
+            (folder_id, timestamp),
+        )
 
 
 def load_baseline(
@@ -273,3 +318,90 @@ def list_events(
         ).fetchall()
 
         return [dict(row) for row in rows]
+
+
+def load_observed_state(
+    folder_id: int,
+    db_path: str | Path = DEFAULT_DB_PATH,
+) -> dict[str, str]:
+    """Load the most recently observed file fingerprints."""
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT file_path, sha256
+            FROM observed_files
+            WHERE folder_id = ?
+            """,
+            (folder_id,),
+        ).fetchall()
+
+        return {row["file_path"]: row["sha256"] for row in rows}
+
+
+def record_events_and_update_observed(
+    folder_id: int,
+    events: list[dict[str, str | None]],
+    current: dict[str, str],
+    db_path: str | Path = DEFAULT_DB_PATH,
+) -> None:
+    """Record detected transitions and atomically save the latest state."""
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    with get_connection(db_path) as connection:
+        connection.executemany(
+            """
+            INSERT INTO audit_events (
+                folder_id, event_type, file_path,
+                old_hash, new_hash, detected_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    folder_id,
+                    event["type"],
+                    event["path"],
+                    event["old_hash"],
+                    event["new_hash"],
+                    timestamp,
+                )
+                for event in events
+            ],
+        )
+        connection.execute(
+            """
+            INSERT INTO observed_state (folder_id, initialized_at)
+            VALUES (?, ?)
+            ON CONFLICT(folder_id) DO UPDATE SET
+                initialized_at = excluded.initialized_at
+            """,
+            (folder_id, timestamp),
+        )
+        connection.execute(
+            "DELETE FROM observed_files WHERE folder_id = ?",
+            (folder_id,),
+        )
+
+        connection.executemany(
+            """
+            INSERT INTO observed_files (folder_id, file_path, sha256)
+            VALUES (?, ?, ?)
+            """,
+            [
+                (folder_id, path, digest)
+                for path, digest in current.items()
+            ],
+        )
+
+def has_observed_state(
+    folder_id: int,
+    db_path: str | Path = DEFAULT_DB_PATH,
+) -> bool:
+    """Return whether observed-state tracking has been initialized."""
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT 1 FROM observed_state WHERE folder_id = ?",
+            (folder_id,),
+        ).fetchone()
+
+        return row is not None
